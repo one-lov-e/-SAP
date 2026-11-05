@@ -1,0 +1,128 @@
+function pullLossesDataFPV() {
+  // === НАЛАШТУВАННЯ ===
+  const SOURCE_SPREADSHEET_ID = "1Fw0FSXfLhjx-6ym__r_rf2FxG-SkVEyVLe8YiJ6k618"; // ID старої (джерельної) таблиці
+  const SOURCE_SHEET_NAME = "Технічна вкладка FPV (не видаляти)"; // Назва аркуша в старій таблиці
+  const TARGET_SHEET_NAME = "Виправлення Втрати FPV"; // Назва аркуша в цій (новій) таблиці
+  
+  // 1. Відкриваємо цю (нову) таблицю
+  const targetSs = SpreadsheetApp.getActiveSpreadsheet();
+  let targetSheet = targetSs.getSheetByName(TARGET_SHEET_NAME);
+  
+  if (!targetSheet) {
+    targetSheet = targetSs.insertSheet(TARGET_SHEET_NAME);
+  }
+  
+  // 2. Відкриваємо стару таблицю та отримуємо дані
+  let sourceSs;
+  try {
+    sourceSs = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+  } catch (e) {
+    Logger.log("Помилка доступу до старої таблиці. Перевірте ID та права доступу.");
+    return;
+  }
+  
+  const sourceSheet = sourceSs.getSheetByName(SOURCE_SHEET_NAME);
+  if (!sourceSheet) {
+    Logger.log("Аркуш '" + SOURCE_SHEET_NAME + "' у старій таблиці не знайдено!");
+    return;
+  }
+  
+  const sourceLastRow = getRealLastRow(sourceSheet, [1, 2, 3, 4, 5, 6, 7]); // Реальний останній рядок у джерелі
+  if (sourceLastRow < 2) {
+    Logger.log("У старій таблиці немає даних для копіювання.");
+    return; // Немає даних (тільки шапка або порожньо)
+  }
+  
+  // Зчитуємо стовпці C-F (cols 3-6, разом 4 стовпці) та I-K (cols 9-11, разом 3 стовпці) починаючи з 2-го рядка
+  const rangeCF = sourceSheet.getRange(2, 3, sourceLastRow - 1, 4).getValues();
+  const rangeIK = sourceSheet.getRange(2, 9, sourceLastRow - 1, 3).getValues();
+  
+  // Об'єднуємо C-F та I-K в один масив
+  const sourceData = [];
+  for (let i = 0; i < rangeCF.length; i++) {
+    // Стовпець F відповідає index 3 у масиві rangeCF (C=0, D=1, E=2, F=3)
+    const valF = String(rangeCF[i][3] || "").trim();
+    
+    // Перевіряємо, чи стовпець F не порожній після видалення пробілів
+    if (valF !== "") {
+      const combinedRow = rangeCF[i].concat(rangeIK[i]);
+      sourceData.push(combinedRow);
+    }
+  }
+
+  // 3. Визначаємо реальний останній рядок у цільовій таблиці (перевіряємо лише інформативні стовпці A–K, тобто 1–11)
+  let targetLastRow = getRealLastRow(targetSheet, [1, 2, 3, 4, 5, 6, 7]); 
+
+  if (targetLastRow === 0) {
+    const headerCF = sourceSheet.getRange(1, 3, 1, 4).getValues()[0];
+    const headerIK = sourceSheet.getRange(1, 9, 1, 3).getValues()[0];
+    const combinedHeader = headerCF.concat(headerIK);
+    targetSheet.getRange(1, 1, 1, combinedHeader.length).setValues([combinedHeader]);
+    targetLastRow = 1; // Тепер є шапка у 1-му рядку
+  }
+  
+  // 4. Зчитуємо вже наявні дані з нової таблиці для запобігання дублікатам (лише до targetLastRow)
+  const existingKeys = new Set();
+  if (targetLastRow > 1) {
+    // Зчитуємо тільки стовпець F (який у цільовій таблиці знаходиться в колонці D чи F — за залежністю від того, як ви вставляєте)
+    // У вашому випадку ви копіюєте 7 стовпців у колонки A-G, тому джерельний F опиняється в цільовому стовпці D (індекс 3).
+    const existingValues = targetSheet.getRange(1, 1, targetLastRow, 7).getValues();
+    for (let i = 1; i < existingValues.length; i++) {
+      const keyF = String(existingValues[i][3] || "").trim();
+      if (keyF) {
+        existingKeys.add(keyF);
+      }
+    }
+  }
+  
+  // 5. Фільтруємо лише нові рядки за значенням у стовпці F (індекс 3)
+  const newRows = sourceData.filter(row => {
+    const keyF = String(row[3] || "").trim();
+    return keyF !== "" && !existingKeys.has(keyF);
+  });
+  
+  // 6. Дописуємо нові рядки безпосередньо за останнім реально заповненим рядком
+  if (newRows.length > 0) {
+    targetSheet.getRange(
+      targetLastRow + 1, 
+      1, 
+      newRows.length, 
+      newRows[0].length
+    ).setValues(newRows);
+    
+    Logger.log("Успішно підтягнуто та додано нових рядків: " + newRows.length);
+  } else {
+    Logger.log("Нових даних для додавання не виявлено.");
+  }
+}
+
+/**
+ * Допоміжна функція для визначення реального останнього рядка із значеннями.
+ * Ігнорує стовпець L (чекбокси) та інші системні значення `false`/`true`/порожні клітинки.
+ * 
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Аркуш для перевірки
+ * @param {Array<number>} checkCols - Індекси стовпців (1-based), які містять змістовні дані (за замовчуванням A–K)
+ */
+function getRealLastRow(sheet, checkCols = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow === 0) return 0;
+  
+  // Отримуємо значення лише з тих стовпчиків, де зберігаються основні дані (без стовпця L)
+  const maxColToCheck = Math.max(...checkCols);
+  const values = sheet.getRange(1, 1, lastRow, maxColToCheck).getValues();
+  
+  for (let i = values.length - 1; i >= 0; i--) {
+    const row = values[i];
+    // Перевіряємо, чи хоча б один із визначених стовпчиків містить непусте значення
+    const hasData = checkCols.some(colIndex => {
+      const val = row[colIndex - 1];
+      return val !== null && val !== undefined && String(val).trim() !== "";
+    });
+    
+    if (hasData) {
+      return i + 1; // 1-based номер рядка
+    }
+  }
+  
+  return 0;
+}
