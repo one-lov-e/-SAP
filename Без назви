@@ -1,0 +1,235 @@
+/**
+ * Основна функція збору та заповнення даних про втрати
+ */
+function populateLossesData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+
+  // 1. Запит дат періоду
+  const startResponse = ui.prompt(
+    'Період звітності',
+    'Введіть дату початку періоду (у форматі ДД.ММ.ГГГГ):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (startResponse.getSelectedButton() !== ui.Button.OK) return;
+  const startDateStr = startResponse.getResponseText().trim();
+
+  const endResponse = ui.prompt(
+    'Період звітності',
+    'Введіть дату кінця періоду (у форматі ДД.ММ.ГГГГ):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (endResponse.getSelectedButton() !== ui.Button.OK) return;
+  const endDateStr = endResponse.getResponseText().trim();
+
+  const startDate = parseDate(startDateStr);
+  const endDate = parseDate(endDateStr);
+
+  if (!startDate || !endDate) {
+    ui.alert('Помилка', 'Некоректний формат дати. Використовуйте формат ДД.ММ.ГГГГ (наприклад: 01.09.2026).', ui.ButtonSet.OK);
+    return;
+  }
+
+  startDate.setHours(0, 0, 0, 0);
+  endDate.setHours(23, 59, 59, 999);
+
+  if (startDate > endDate) {
+    ui.alert('Помилка', 'Дата початку періоду не може бути більшою за дату кінця періоду.', ui.ButtonSet.OK);
+    return;
+  }
+
+  // 2. Конфігурація джерел даних (6 вкладок)
+  const sourcesConfig = [
+    {
+      sheetName: 'Технічна втрата бортів (не видаляти)',
+      dateColName: 'Час подання',
+      nameColName: 'Найменування',
+      numColName: 'Номер'
+    },
+    {
+      sheetName: 'Технічна вкладка FPV (не видаляти)',
+      dateColName: 'Час втрати (верифікації втрати) борту',
+      nameColName: 'Найменування',
+      numColName: 'Номер'
+    },
+    {
+      sheetName: 'БПЛА УД-15',
+      dateColName: 'Час подання',
+      nameColName: 'Тип дрону',
+      numColName: 'drone_Но'
+    },
+    {
+      sheetName: 'Втрати Перехоплення',
+      dateColName: 'Час втрати (верифікації втрати) борту',
+      nameColName: 'Найменування',
+      numColName: 'Номер'
+    },
+    {
+      sheetName: 'РУКАМИ',
+      dateColName: 'дата втрати',
+      nameColName: 'Назва',
+      numColName: 'Номер борту'
+    },
+    {
+      sheetName: 'Втрати НРК',
+      dateColName: 'Дата втрати',
+      defaultDateColIdx: 13, // Стовпчик N (дата втрати)
+      nameColName: 'Назва',
+      numColName: 'Номер комплексу',
+      statusColName: 'Статус',
+      statusFilter: 'втрачено' // Брати тільки втрачені комплекси
+    }
+  ];
+
+  const extractedRows = [];
+
+  // 3. Збір рядків із вкладок
+  sourcesConfig.forEach(cfg => {
+    const sheet = ss.getSheetByName(cfg.sheetName);
+    if (!sheet) return;
+
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 2) return;
+
+    let headerRowIdx = -1;
+    let colDateIdx = -1;
+    let colNameIdx = -1;
+    let colNumIdx = -1;
+    let colStatusIdx = -1;
+
+    // Пошук індексів стовпчиків у перших трьох рядках
+    for (let r = 0; r < Math.min(3, data.length); r++) {
+      const row = data[r].map(cell => (cell ? cell.toString().trim() : ''));
+      
+      const dIdx = row.findIndex(h => cfg.dateColName && h.toLowerCase() === cfg.dateColName.toLowerCase());
+      const nIdx = row.findIndex(h => cfg.nameColName && h.toLowerCase() === cfg.nameColName.toLowerCase());
+      const numIdx = row.findIndex(h => cfg.numColName && h.toLowerCase() === cfg.numColName.toLowerCase());
+      const sIdx = cfg.statusColName ? row.findIndex(h => h.toLowerCase() === cfg.statusColName.toLowerCase()) : -1;
+
+      // Для стовпчика дати дозволяємо використання фіксованого індексу, якщо назви немає в шапці (як у 'Втрати НРК')
+      const effectiveDateIdx = (dIdx !== -1) ? dIdx : (cfg.defaultDateColIdx !== undefined ? cfg.defaultDateColIdx : -1);
+
+      if (nIdx !== -1 && numIdx !== -1 && effectiveDateIdx !== -1) {
+        headerRowIdx = r;
+        colDateIdx = effectiveDateIdx;
+        colNameIdx = nIdx;
+        colNumIdx = numIdx;
+        if (sIdx !== -1) colStatusIdx = sIdx;
+        break;
+      }
+    }
+
+    if (headerRowIdx === -1) return;
+
+    // Сканування даних
+    for (let i = headerRowIdx + 1; i < data.length; i++) {
+      const row = data[i];
+
+      // Перевірка статусу (якщо заданий фільтр, наприклад, "Втрачено")
+      if (cfg.statusFilter && colStatusIdx !== -1) {
+        const statusVal = row[colStatusIdx] ? row[colStatusIdx].toString().trim().toLowerCase() : '';
+        if (statusVal !== cfg.statusFilter.toLowerCase()) {
+          continue;
+        }
+      }
+
+      const rawDate = row[colDateIdx];
+      const rowDate = normalizeDate(rawDate);
+
+      if (rowDate && rowDate >= startDate && rowDate <= endDate) {
+        const nameVal = row[colNameIdx] !== undefined && row[colNameIdx] !== null ? row[colNameIdx].toString().trim() : '';
+        const numVal = row[colNumIdx] !== undefined && row[colNumIdx] !== null ? row[colNumIdx].toString().trim() : '';
+
+        if (nameVal !== '' || numVal !== '') {
+          extractedRows.push([nameVal, numVal]);
+        }
+      }
+    }
+  });
+
+  // 4. Запис у цільову вкладку
+  const targetSheet = ss.getSheetByName('Втрати для КСБС') || ss.getSheetByName('Вкладка КСБС');
+  if (!targetSheet) {
+    ui.alert('Помилка', 'Не знайдено вкладку "Втрати для КСБС".', ui.ButtonSet.OK);
+    return;
+  }
+
+  const targetData = targetSheet.getDataRange().getValues();
+  const targetHeaders = targetData[0].map(h => (h ? h.toString().trim().toLowerCase() : ''));
+
+  let targetNameColIdx = targetHeaders.indexOf('засіб');
+  let targetNumColIdx = targetHeaders.indexOf('витягнутий номер засобу');
+
+  if (targetNameColIdx === -1) targetNameColIdx = 8; // Стовпчик I
+  if (targetNumColIdx === -1) targetNumColIdx = 9; // Стовпчик J
+
+  if (extractedRows.length === 0) {
+    ui.alert('Інформація', 'За вказаний період записів не знайдено.', ui.ButtonSet.OK);
+    return;
+  }
+
+  // Очищення попередніх значень
+  const lastRow = Math.max(targetSheet.getLastRow(), 2);
+  if (lastRow >= 2) {
+    targetSheet.getRange(2, targetNameColIdx + 1, lastRow - 1, 1).clearContent();
+    targetSheet.getRange(2, targetNumColIdx + 1, lastRow - 1, 1).clearContent();
+  }
+
+  // Запис нових значень
+  const namesRange = extractedRows.map(r => [r[0]]);
+  const numsRange = extractedRows.map(r => [r[1]]);
+
+  targetSheet.getRange(2, targetNameColIdx + 1, namesRange.length, 1).setValues(namesRange);
+  targetSheet.getRange(2, targetNumColIdx + 1, numsRange.length, 1).setValues(numsRange);
+
+  ui.alert(
+    'Готово!',
+    `Успішно заповнено ${extractedRows.length} записів за період з ${startDateStr} по ${endDateStr}.`,
+    ui.ButtonSet.OK
+  );
+}
+
+/**
+ * Парсинг введеної користувачем дати у форматі ДД.ММ.ГГГГ
+ */
+function parseDate(str) {
+  if (!str) return null;
+  const parts = str.split(/[./-]/);
+  if (parts.length === 3) {
+    const day = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10) - 1;
+    const year = parseInt(parts[2], 10);
+    if (!isNaN(day) && !isNaN(month) && !isNaN(year)) {
+      return new Date(year, month, day);
+    }
+  }
+  return null;
+}
+
+/**
+ * Універсальна нормалізація дати з комірки (Date об'єкт, ДД.ММ.РРРР або РРРР-ММ-ДД)
+ */
+function normalizeDate(val) {
+  if (!val) return null;
+  if (val instanceof Date) {
+    return new Date(val.getFullYear(), val.getMonth(), val.getDate());
+  }
+
+  const s = val.toString().trim();
+  if (!s) return null;
+
+  // Формат ДД.ММ.РРРР
+  const dmyMatch = s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})/);
+  if (dmyMatch) {
+    return new Date(parseInt(dmyMatch[3], 10), parseInt(dmyMatch[2], 10) - 1, parseInt(dmyMatch[1], 10));
+  }
+
+  // Формат РРРР-ММ-ДД
+  const ymdMatch = s.match(/^(\d{4})[./-](\d{1,2})[./-](\d{1,2})/);
+  if (ymdMatch) {
+    return new Date(parseInt(ymdMatch[1], 10), parseInt(ymdMatch[2], 10) - 1, parseInt(ymdMatch[3], 10));
+  }
+
+  const parsed = new Date(s);
+  return isNaN(parsed.getTime()) ? null : new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+}
