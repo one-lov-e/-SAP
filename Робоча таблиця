@@ -1,0 +1,111 @@
+function updateWorkingTable() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  const sourceSheet = ss.getSheetByName("НОВЕ"); 
+  const targetSheet = ss.getSheetByName("Робоча таблиця");
+  
+  if (!sourceSheet || !targetSheet) {
+    SpreadsheetApp.getUi().alert("Помилка: Перевірте назви вкладок 'НОВЕ' та 'Робоча таблиця'");
+    return;
+  }
+
+  const sourceLastRow = sourceSheet.getLastRow();
+  if (sourceLastRow < 2) {
+    SpreadsheetApp.getUi().alert("Немає даних для перенесення на вкладці 'НОВЕ'");
+    return;
+  }
+  // Зчитуємо перші 12 колонок (A-L) з вкладки НОВЕ
+  const sourceData = sourceSheet.getRange(2, 1, sourceLastRow - 1, 12).getValues();
+  
+  // ЗБИРАЄМО ІСНУЮЧІ КЛЮЧІ З РОБОЧОЇ ТАБЛИЦІ (Враховуємо порожню D і заповнену E)
+  let existingKeys = new Set();
+  const targetLastRow = targetSheet.getLastRow();
+  if (targetLastRow > 1) {
+    // Зчитуємо перші 5 колонок (A-E) з Робочої таблиці
+    const targetData = targetSheet.getRange(2, 1, targetLastRow - 1, 5).getValues(); 
+    targetData.forEach(row => {
+      let nameT = row[1] ? String(row[1]).trim() : "";
+      let dNumT = row[3] ? String(row[3]).trim().replace(/\.0$/, "") : ""; // Колонка D
+      let eNumT = row[4] ? String(row[4]).trim().replace(/\.0$/, "") : ""; // Колонка E
+      
+      // ПРАВИЛО: Якщо D порожня, то головним є номер з Е
+      let finalNumT = "";
+      if (dNumT !== "") {
+        finalNumT = dNumT;
+      } else if (eNumT !== "") {
+        finalNumT = eNumT;
+      }
+      
+      if (nameT !== "" && finalNumT !== "") {
+        existingKeys.add(nameT + "|" + finalNumT);
+      }
+    });
+  }
+  
+  const rowsToAdd = [];
+
+  // ОБРОБКА ДАНИХ З ВКЛАДКИ "НОВЕ"
+  for (let i = 0; i < sourceData.length; i++) {
+    const row = sourceData[i];
+    
+    const name = row[1] ? String(row[1]).trim() : "";
+    const dNum = row[3] ? String(row[3]).trim().replace(/\.0$/, "") : ""; // Колонка D
+    const eNum = row[4] ? String(row[4]).trim().replace(/\.0$/, "") : ""; // Колонка E
+    const docNum = row[10] ? String(row[10]).trim() : "";                 // Колонка K (Номер АПП)
+    
+    // Перевірка дати в колонці L
+    let docDate = "";
+    if (row[11]) {
+      if (row[11] instanceof Date) {
+        if (!isNaN(row[11].getTime())) docDate = "VALID";
+      } else {
+        let dateStr = String(row[11]).trim();
+        if (dateStr !== "" && dateStr.length >= 8) docDate = dateStr;
+      }
+    }
+    
+    // ПРАВИЛО: Якщо D порожня, беремо номер з Е
+    let currentNum = "";
+    if (dNum !== "") {
+      currentNum = dNum;
+    } else if (eNum !== "") {
+      currentNum = eNum;
+    }
+    
+    const key = name + "|" + currentNum;
+
+    // Перевірка умов перенесення
+    if (name !== "" && currentNum !== "" && docNum !== "" && docDate !== "") {
+      if (!existingKeys.has(key)) {
+        let newRow = row.slice(0, 12); 
+        newRow.push(false); // Чекбокс для колонки М
+        
+        rowsToAdd.push(newRow);
+        existingKeys.add(key); // Додаємо в сет, щоб уникнути дублів всередині однієї пачки
+      }
+    }
+  }
+
+  // ЗАПИС РЕЗУЛЬТАТУ В ТАБЛИЦЮ
+  if (rowsToAdd.length > 0) {
+    let realTargetLastRow = targetSheet.getLastRow();
+    const checkRange = targetSheet.getRange(1, 1, targetSheet.getMaxRows(), 1).getValues();
+    for (let r = checkRange.length - 1; r >= 0; r--) {
+      if (checkRange[r][0] !== "") {
+        realTargetLastRow = r + 1;
+        break;
+      }
+    }
+    
+    const startRow = realTargetLastRow + 1;
+    
+    // Вставляємо основні дані (12 колонок)
+    targetSheet.getRange(startRow, 1, rowsToAdd.length, 12).setValues(rowsToAdd.map(r => r.slice(0, 12)));
+    // Вставляємо чекбокси у 13-ту колонку (М)
+    targetSheet.getRange(startRow, 13, rowsToAdd.length, 1).insertCheckboxes();
+    
+    SpreadsheetApp.getUi().alert("Успішно перенесено нових позицій: " + rowsToAdd.length);
+  } else {
+    SpreadsheetApp.getUi().alert("Нових позицій не знайдено. Перевірте, чи заповнені колонки K та L, або чи немає цих БПЛА з номерами з колонки E вже у 'Робочій таблиці'.");
+  }
+}
