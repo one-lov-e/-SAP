@@ -1,0 +1,149 @@
+function pullLossesDataNEM() {
+  // === НАЛАШТУВАННЯ ===
+  const SOURCE_SPREADSHEET_ID = "1Fw0FSXfLhjx-6ym__r_rf2FxG-SkVEyVLe8YiJ6k618"; // ID старої (джерельної) таблиці
+  const SOURCE_SHEET_NAME = "Технічна втрата бортів (не видаляти)"; // Назва аркуша в старій таблиці
+  const TARGET_SHEET_NAME = "Втрата бортів"; // Назва аркуша в цій (новій) таблиці
+
+  // 1. Відкриваємо цільову таблицю
+  const targetSs = SpreadsheetApp.getActiveSpreadsheet();
+  let targetSheet = targetSs.getSheetByName(TARGET_SHEET_NAME);
+
+  if (!targetSheet) {
+    targetSheet = targetSs.insertSheet(TARGET_SHEET_NAME);
+  }
+
+  // 2. Відкриваємо стару таблицю та отримуємо дані
+  let sourceSs;
+  try {
+    sourceSs = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+  } catch (e) {
+    Logger.log("Помилка доступу до старої таблиці. Перевірте ID та права доступу.");
+    return;
+  }
+
+  const sourceSheet = sourceSs.getSheetByName(SOURCE_SHEET_NAME);
+  if (!sourceSheet) {
+    Logger.log("Аркуш '" + SOURCE_SHEET_NAME + "' у старій таблиці не знайдено!");
+    return;
+  }
+
+  const sourceLastRow = getRealLastRow(sourceSheet, [1, 2, 3, 4, 5, 6, 7]); // Реальний останній рядок у джерелі
+  if (sourceLastRow < 2) {
+    Logger.log("У старій таблиці немає даних для копіювання.");
+    return;
+  }
+
+  // Зчитуємо стовпці C-F (cols 3-6, 4 стовпці) та I-K (cols 9-11, 3 стовпці)
+  const rangeCF = sourceSheet.getRange(2, 3, sourceLastRow - 1, 4).getValues();
+  const rangeIK = sourceSheet.getRange(2, 9, sourceLastRow - 1, 3).getValues();
+
+  // Об'єднуємо C-F та I-K в один масив
+  const sourceData = [];
+  for (let i = 0; i < rangeCF.length; i++) {
+    const valF = normalizeValue(rangeCF[i][3]); // Стовпець F (індекс 3)
+    const valD = normalizeValue(rangeCF[i][1]); // Стовпець D (індекс 1)
+
+    // Перевіряємо, щоб ключові значення не були порожніми
+    if (valF !== "" && valD !== "") {
+      const combinedRow = rangeCF[i].concat(rangeIK[i]);
+      sourceData.push(combinedRow);
+    }
+  }
+
+  // 3. Визначаємо реальний останній рядок у цільовій таблиці
+  let targetLastRow = getRealLastRow(targetSheet, [1, 2, 3, 4, 5, 6, 7]);
+
+  if (targetLastRow === 0) {
+    const headerCF = sourceSheet.getRange(1, 3, 1, 4).getValues()[0];
+    const headerIK = sourceSheet.getRange(1, 9, 1, 3).getValues()[0];
+    const combinedHeader = headerCF.concat(headerIK);
+    targetSheet.getRange(1, 1, 1, combinedHeader.length).setValues([combinedHeader]);
+    targetLastRow = 1; // Шапка створена
+  }
+
+  // 4. Зчитуємо наявні ключі (комбінація F та D) з цільової таблиці
+  const existingKeys = new Set();
+  const tz = Session.getScriptTimeZone();
+
+  if (targetLastRow > 1) {
+    // У цільовій таблиці:
+    // стовпець B (індекс 1) — це drone_id (джерельний D)
+    // стовпець D (індекс 3) — це час подання (джерельний F)
+    const existingValues = targetSheet.getRange(1, 1, targetLastRow, 7).getValues();
+
+    for (let i = 1; i < existingValues.length; i++) {
+      const exD = normalizeValue(existingValues[i][1], tz);
+      const exF = normalizeValue(existingValues[i][3], tz);
+
+      if (exF && exD) {
+        existingKeys.add(`${exF}|${exD}`);
+      }
+    }
+  }
+
+  // 5. Фільтруємо лише нові рядки за комбінованим ключем (F + D)
+  const newRows = [];
+  for (let i = 0; i < sourceData.length; i++) {
+    const row = sourceData[i];
+    const rowD = normalizeValue(row[1], tz); // D (індекс 1)
+    const rowF = normalizeValue(row[3], tz); // F (індекс 3)
+    const compositeKey = `${rowF}|${rowD}`;
+
+    if (!existingKeys.has(compositeKey)) {
+      existingKeys.add(compositeKey); // Запобігає дублюванню рядків усередині самого джерела
+      newRows.push(row);
+    }
+  }
+
+  // 6. Дописуємо нові рядки
+  if (newRows.length > 0) {
+    targetSheet.getRange(
+      targetLastRow + 1,
+      1,
+      newRows.length,
+      newRows[0].length
+    ).setValues(newRows);
+
+    Logger.log("Успішно підтягнуто та додано нових рядків: " + newRows.length);
+  } else {
+    Logger.log("Нових даних для додавання не виявлено.");
+  }
+}
+
+/**
+ * Допоміжна функція нормалізації значень.
+ * Коректно перетворює дати (об'єкти Date) та звичайні рядки/числа до уніфікованого формату.
+ */
+function normalizeValue(val, timeZone) {
+  if (val === null || val === undefined) return "";
+  if (val instanceof Date) {
+    const tz = timeZone || Session.getScriptTimeZone();
+    return Utilities.formatDate(val, tz, "yyyy-MM-dd HH:mm:ss");
+  }
+  return String(val).trim();
+}
+
+/**
+ * Допоміжна функція для визначення реального останнього рядка із значеннями.
+ */
+function getRealLastRow(sheet, checkCols = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow === 0) return 0;
+
+  const maxColToCheck = Math.max(...checkCols);
+  const values = sheet.getRange(1, 1, lastRow, maxColToCheck).getValues();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    const row = values[i];
+    const hasData = checkCols.some(colIndex => {
+      const val = row[colIndex - 1];
+      return val !== null && val !== undefined && String(val).trim() !== "";
+    });
+
+    if (hasData) {
+      return i + 1;
+    }
+  }
+
+  return 0;
+}
