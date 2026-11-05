@@ -1,0 +1,315 @@
+/**
+ * Основна функція збору та заповнення даних про втрати
+ */
+function populateLossesData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+
+  // 1. Запит дат періоду
+  const startResponse = ui.prompt(
+    'Період звітності',
+    'Введіть дату початку періоду (наприклад: 16.10.2026):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (startResponse.getSelectedButton() !== ui.Button.OK) return;
+  const startDateStr = startResponse.getResponseText().trim();
+
+  const endResponse = ui.prompt(
+    'Період звітності',
+    'Введіть дату кінця періоду (наприклад: 16.10.2026):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (endResponse.getSelectedButton() !== ui.Button.OK) return;
+  const endDateStr = endResponse.getResponseText().trim();
+
+  const startDate = parseDate(startDateStr);
+  const endDate = parseDate(endDateStr);
+
+  if (!startDate || !endDate) {
+    ui.alert('Помилка', 'Некоректний формат дати. Вводьте дату у форматі ДД.ММ.ГГГГ (наприклад: 16.10.2026).', ui.ButtonSet.OK);
+    return;
+  }
+
+  startDate.setHours(0, 0, 0, 0);
+  endDate.setHours(23, 59, 59, 999);
+
+  if (startDate > endDate) {
+    ui.alert('Помилка', 'Дата початку не може бути більшою за дату кінця.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const extractedRows = [];
+
+  // 2. Збір даних зі стандартних 5 вкладок (швидке зчитування getValues)
+  const standardSourcesConfig = [
+    { sheetName: 'Технічна втрата бортів (не видаляти)', dateColName: 'Час подання', nameColName: 'Найменування', numColName: 'Номер' },
+    { sheetName: 'Технічна вкладка FPV (не видаляти)', dateColName: 'Час втрати (верифікації втрати) борту', nameColName: 'Найменування', numColName: 'Номер' },
+    { sheetName: 'БПЛА УД-15', dateColName: 'Час подання', nameColName: 'Тип дрону', numColName: 'drone_Но' },
+    { sheetName: 'Втрати Перехоплення', dateColName: 'Час втрати (верифікації втрати) борту', nameColName: 'Найменування', numColName: 'Номер' },
+    { sheetName: 'РУКАМИ', dateColName: 'дата втрати', nameColName: 'Назва', numColName: 'Номер борту' }
+  ];
+
+  standardSourcesConfig.forEach(cfg => {
+    const sheet = ss.getSheetByName(cfg.sheetName);
+    if (!sheet) return;
+
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 2) return;
+
+    let dIdx = -1, nIdx = -1, numIdx = -1, hRow = -1;
+    for (let r = 0; r < Math.min(3, data.length); r++) {
+      const row = data[r].map(c => (c ? c.toString().trim().toLowerCase() : ''));
+      dIdx = row.findIndex(h => h === cfg.dateColName.toLowerCase());
+      nIdx = row.findIndex(h => h === cfg.nameColName.toLowerCase());
+      numIdx = row.findIndex(h => h === cfg.numColName.toLowerCase());
+      if (dIdx !== -1 && nIdx !== -1 && numIdx !== -1) {
+        hRow = r;
+        break;
+      }
+    }
+
+    if (hRow === -1) return;
+
+    for (let i = hRow + 1; i < data.length; i++) {
+      const row = data[i];
+      const rowDate = normalizeDate(row[dIdx]);
+
+      if (rowDate && rowDate >= startDate && rowDate <= endDate) {
+        const nameVal = row[nIdx] !== undefined && row[nIdx] !== null ? row[nIdx].toString().trim() : '';
+        const numVal = row[numIdx] !== undefined && row[numIdx] !== null ? row[numIdx].toString().trim() : '';
+        if (nameVal !== '' || numVal !== '') {
+          extractedRows.push([nameVal, numVal]);
+        }
+      }
+    }
+  });
+
+  // 3. Збір даних з вкладки "Втрати НРК" за вашим алгоритмом
+  const nrkSheet = ss.getSheetByName('Втрати НРК');
+  if (nrkSheet) {
+    const nrkData = nrkSheet.getDataRange().getValues();
+
+    for (let i = 2; i < nrkData.length; i++) {
+      const row = nrkData[i];
+
+      // КРОК 1: Шукаємо перше "Втрачено" у стовпчику M (індекс 12) або N (індекс 13)
+      let firstLostIdx = -1;
+      const valM = (row[12] || '').toString().trim().toLowerCase();
+      const valN = (row[13] || '').toString().trim().toLowerCase();
+
+      if (valM.includes('втрачено')) firstLostIdx = 12;
+      else if (valN.includes('втрачено')) firstLostIdx = 13;
+
+      if (firstLostIdx === -1) continue; // У цьому рядку немає базового статусу "Втрачено"
+
+      // КРОК 2: Шукаємо в цьому рядку ЗНОВУ (повторно) значення "Втрачено" праворуч
+      let secondLostIdx = -1;
+      for (let c = firstLostIdx + 1; c < row.length; c++) {
+        const txt = (row[c] || '').toString().trim().toLowerCase();
+        if (txt.includes('втрачено')) {
+          secondLostIdx = c;
+        }
+      }
+
+      if (secondLostIdx === -1) continue; // Немає повторного "Втрачено"
+
+      // КРОК 3: Рухаємось по клітинках вліво і беремо першу дату, яка трапиться
+      let lossDate = null;
+      for (let c = secondLostIdx - 1; c >= 0; c--) {
+        const d = normalizeDate(row[c]);
+        if (d) {
+          lossDate = d;
+          break;
+        }
+      }
+
+      // КРОК 4: Якщо вона в нашому періоді — забираємо Засіб і Витягнутий номер засобу
+      if (lossDate && lossDate >= startDate && lossDate <= endDate) {
+        let nameVal = '';
+        let numVal = '';
+
+        // Перевіряємо, чи в колонці В стоїть "Логістичний/Бойовий", чи сама назва
+        const bVal = (row[1] || '').toString().trim();
+        if (bVal.toLowerCase() === 'логістичний' || bVal.toLowerCase() === 'бойовий') {
+          nameVal = (row[2] || '').toString().trim(); // Колонка C (Назва)
+          numVal = (row[3] || '').toString().trim().replace(/\.0$/, ''); // Колонка D (Номер)
+        } else {
+          nameVal = bVal;
+          numVal = (row[2] || '').toString().trim().replace(/\.0$/, '');
+        }
+
+        if (numVal === '') numVal = 'б/н';
+
+        if (nameVal !== '') {
+          extractedRows.push([nameVal, numVal]);
+        }
+      }
+    }
+  }
+
+  // 4. Запис результату у вкладку "Втрати для КСБС"
+  const targetSheet = ss.getSheetByName('Втрати для КСБС') || ss.getSheetByName('Вкладка КСБС');
+  if (!targetSheet) {
+    ui.alert('Помилка', 'Не знайдено вкладку "Втрати для КСБС".', ui.ButtonSet.OK);
+    return;
+  }
+
+  const targetHeaders = targetSheet.getRange(1, 1, 1, targetSheet.getLastColumn()).getValues()[0].map(h => (h || '').toString().trim().toLowerCase());
+  let targetNameColIdx = targetHeaders.indexOf('засіб');
+  let targetNumColIdx = targetHeaders.indexOf('витягнутий номер засобу');
+
+  if (targetNameColIdx === -1) targetNameColIdx = 8; // Стовпчик I
+  if (targetNumColIdx === -1) targetNumColIdx = 9; // Стовпчик J
+
+  if (extractedRows.length === 0) {
+    ui.alert('Інформація', 'За вказаний період записів не знайдено.', ui.ButtonSet.OK);
+    return;
+  }
+
+  // Очищення попередніх значень
+  const lastRow = Math.max(targetSheet.getLastRow(), 2);
+  if (lastRow >= 2) {
+    targetSheet.getRange(2, targetNameColIdx + 1, lastRow - 1, 1).clearContent();
+    targetSheet.getRange(2, targetNumColIdx + 1, lastRow - 1, 1).clearContent();
+  }
+
+  // Запис нових даних
+  const namesRange = extractedRows.map(r => [r[0]]);
+  const numsRange = extractedRows.map(r => [r[1]]);
+
+  targetSheet.getRange(2, targetNameColIdx + 1, namesRange.length, 1).setValues(namesRange);
+  targetSheet.getRange(2, targetNumColIdx + 1, numsRange.length, 1).setValues(numsRange);
+
+  ui.alert(
+    'Готово!',
+    `Успішно зібрано та заповнено ${extractedRows.length} записів за період з ${startDateStr} по ${endDateStr}.`,
+    ui.ButtonSet.OK
+  );
+}
+
+/**
+ * ШВИДКИЙ ТЕСТ ЛОГІКИ НРК
+ * Натисніть "Виконати" для цієї функції — вона миттєво перевірить лише вкладку "Втрати НРК" на 16.10.2026
+ */
+function testNRK() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const nrkSheet = ss.getSheetByName('Втрати НРК');
+  if (!nrkSheet) {
+    SpreadsheetApp.getUi().alert('Вкладку "Втрати НРК" не знайдено');
+    return;
+  }
+
+  const startDate = new Date(2026, 9, 16, 0, 0, 0);
+  const endDate = new Date(2026, 9, 16, 23, 59, 59);
+
+  const nrkData = nrkSheet.getDataRange().getValues();
+  const results = [];
+
+  for (let i = 2; i < nrkData.length; i++) {
+    const row = nrkData[i];
+
+    let firstLostIdx = -1;
+    const valM = (row[12] || '').toString().trim().toLowerCase();
+    const valN = (row[13] || '').toString().trim().toLowerCase();
+
+    if (valM.includes('втрачено')) firstLostIdx = 12;
+    else if (valN.includes('втрачено')) firstLostIdx = 13;
+
+    if (firstLostIdx === -1) continue;
+
+    let secondLostIdx = -1;
+    for (let c = firstLostIdx + 1; c < row.length; c++) {
+      const txt = (row[c] || '').toString().trim().toLowerCase();
+      if (txt.includes('втрачено')) {
+        secondLostIdx = c;
+      }
+    }
+
+    if (secondLostIdx === -1) continue;
+
+    let lossDate = null;
+    for (let c = secondLostIdx - 1; c >= 0; c--) {
+      const d = normalizeDate(row[c]);
+      if (d) {
+        lossDate = d;
+        break;
+      }
+    }
+
+    if (lossDate && lossDate >= startDate && lossDate <= endDate) {
+      const bVal = (row[1] || '').toString().trim();
+      let nameVal = (bVal.toLowerCase() === 'логістичний' || bVal.toLowerCase() === 'бойовий') ? (row[2] || '').toString().trim() : bVal;
+
+      let numVal = (bVal.toLowerCase() === 'логістичний' || bVal.toLowerCase() === 'бойовий') ? (row[3] || '').toString().trim() : (row[2] || '').toString().trim();
+
+      results.push(`Рядок ${i + 1}: ${nameVal} | № ${numVal}`);
+    }
+  }
+
+  SpreadsheetApp.getUi().alert(`Знайдено НРК за 16.10.2026 (${results.length} шт.):\n\n` + results.join('\n'));
+}
+
+/**
+ * Парсинг введеної користувачем дати
+ */
+function parseDate(str) {
+  if (!str) return null;
+  const s = str.trim();
+  const match = s.match(/(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})/);
+  if (match) {
+    const day = parseInt(match[1], 10);
+    const month = parseInt(match[2], 10) - 1;
+    let year = parseInt(match[3], 10);
+    if (year < 100) year += 2000;
+    return new Date(year, month, day);
+  }
+  return null;
+}
+
+/**
+ * Універсальна нормалізація дати з клітинки (Date об'єкт, рядок або число Sheets 46311)
+ */
+function normalizeDate(val) {
+  if (val === null || val === undefined || val === '') return null;
+
+  if (val instanceof Date) {
+    return isNaN(val.getTime()) ? null : new Date(val.getFullYear(), val.getMonth(), val.getDate());
+  }
+
+  // Числовий день Sheets/Excel (наприклад, 46311 для 16.10.2026)
+  if (typeof val === 'number') {
+    if (val >= 35000 && val <= 65000) {
+      const utcMs = Math.round((val - 25569) * 86400 * 1000);
+      const d = new Date(utcMs);
+      return new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+    }
+    return null;
+  }
+
+  const s = val.toString().replace(/[\r\n\t]/g, ' ').trim();
+  if (!s) return null;
+
+  if (/^\d{5}$/.test(s)) {
+    const num = parseInt(s, 10);
+    if (num >= 35000 && num <= 65000) {
+      const utcMs = Math.round((num - 25569) * 86400 * 1000);
+      const d = new Date(utcMs);
+      return new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+    }
+  }
+
+  const dmyMatch = s.match(/\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b/);
+  if (dmyMatch) {
+    let year = parseInt(dmyMatch[3], 10);
+    if (year < 100) year += 2000;
+    return new Date(year, parseInt(dmyMatch[2], 10) - 1, parseInt(dmyMatch[1], 10));
+  }
+
+  const ymdMatch = s.match(/\b(\d{4})[./-](\d{1,2})[./-](\d{1,2})\b/);
+  if (ymdMatch) {
+    return new Date(parseInt(ymdMatch[1], 10), parseInt(ymdMatch[2], 10) - 1, parseInt(ymdMatch[3], 10));
+  }
+
+  const parsed = new Date(s);
+  return isNaN(parsed.getTime()) ? null : new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+}
